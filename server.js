@@ -6,7 +6,7 @@ const path = require('path');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
 
 const pool = mysql.createPool({
   host: 'gateway01.ap-northeast-1.prod.aws.tidbcloud.com',
