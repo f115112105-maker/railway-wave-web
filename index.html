@@ -1,0 +1,245 @@
+﻿<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <title>音檔波形 & FFT 頻譜分析器 (雲端多機同步版)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: "Microsoft JhengHei", sans-serif; background: #1e1e24; color: #f0f0f0; margin: 0; padding: 14px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: #2b2b36; padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; }
+    .toolbar label { font-size: 13px; color: #ccc; }
+    .toolbar input, .toolbar select, .toolbar button { padding: 5px 10px; border-radius: 4px; border: 1px solid #444; background: #181820; color: #fff; }
+    .toolbar button { background: #2563eb; border: none; cursor: pointer; font-weight: bold; }
+    .toolbar button:hover { background: #1d4ed8; }
+    .sync-badge { margin-left: auto; font-size: 12px; padding: 4px 10px; border-radius: 12px; background: #065f46; color: #6ee7b7; }
+    .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 12px; }
+    .charts { display: flex; flex-direction: column; gap: 12px; }
+    .card { background: #2b2b36; border-radius: 8px; padding: 12px; }
+    .card h3 { margin: 0 0 8px 0; font-size: 14px; color: #93c5fd; }
+    table { width: 100%; border-collapse: collapse; font-family: Consolas, monospace; font-size: 12px; }
+    th, td { border-bottom: 1px solid #3f3f4e; padding: 5px 6px; text-align: left; }
+    th { background: #20202a; position: sticky; top: 0; }
+    tr:hover { background: #383848; cursor: pointer; }
+    tr.active { background: #1e40af; }
+    .table-wrap { max-height: 520px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+
+<div class="toolbar">
+  <input type="file" id="audioInput" accept="audio/*" />
+  <label>聲道:
+    <select id="channel"><option value="CH1">CH1</option><option value="CH2">CH2</option></select>
+  </label>
+  <label>FFT起點(s):
+    <input type="number" id="startTime" step="0.1" value="1.0" style="width:75px" />
+  </label>
+  <label>FFT點數:
+    <select id="fftPoints"><option value="1024">1024</option><option value="2048" selected>2048</option><option value="4096">4096</option></select>
+  </label>
+  <label><input type="checkbox" id="hann" checked /> Hann窗</label>
+  <label><input type="checkbox" id="removeDc" checked /> 去DC</label>
+  <button onclick="pushState(true)">同步更新至雲端</button>
+  <span class="sync-badge" id="syncStatus">● 雲端即時同步中</span>
+</div>
+
+<div class="grid">
+  <div class="charts">
+    <div class="card">
+      <h3 id="waveTitle">時域波形圖 (Time Domain Waveform)</h3>
+      <canvas id="waveChart" height="125"></canvas>
+    </div>
+    <div class="card">
+      <h3>FFT 頻譜圖 (Magnitude Spectrum)</h3>
+      <canvas id="fftChart" height="125"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>原始取樣 Hex / 十進位 / 二進位數值表 (點擊列可同步標記)</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>位置</th><th>位址</th><th>Hex</th><th>十進位</th><th>二進位 (16-bit)</th></tr>
+        </thead>
+        <tbody id="hexBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let rawSamples = [];
+let sampleRate = 44100;
+let lastUpdated = "";
+let isUpdatingFromCloud = false;
+
+const waveChart = new Chart(document.getElementById('waveChart'), {
+  type: 'line',
+  data: { labels: [], datasets: [{ label: '振幅', data: [], borderColor: '#38bdf8', borderWidth: 1.2, pointRadius: 0 }] },
+  options: { animation: false, scales: { x: { display: false }, y: { min: -1, max: 1 } } }
+});
+
+const fftChart = new Chart(document.getElementById('fftChart'), {
+  type: 'line',
+  data: { labels: [], datasets: [{ label: '頻譜能量', data: [], borderColor: '#f472b6', borderWidth: 1.2, pointRadius: 0 }] },
+  options: { animation: false, scales: { x: { ticks: { maxTicksLimit: 10 } } } }
+});
+
+document.getElementById('audioInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const ctx = new AudioContext();
+  const buf = await file.arrayBuffer();
+  const audioBuf = await ctx.decodeAudioData(buf);
+  sampleRate = audioBuf.sampleRate;
+  const ch = document.getElementById('channel').value === 'CH2' && audioBuf.numberOfChannels > 1 ? 1 : 0;
+  rawSamples = Array.from(audioBuf.getChannelData(ch));
+  document.getElementById('waveTitle').innerText = `時域波形圖 - ${file.name}`;
+  computeAndRender(file.name, true);
+});
+
+function computeAndRender(fileName = null, shouldPush = false) {
+  if (rawSamples.length === 0) return;
+  const startSec = parseFloat(document.getElementById('startTime').value) || 0;
+  const N = parseInt(document.getElementById('fftPoints').value) || 2048;
+  const useHann = document.getElementById('hann').checked;
+  const rmDc = document.getElementById('removeDc').checked;
+
+  const startIdx = Math.min(Math.floor(startSec * sampleRate), Math.max(0, rawSamples.length - N));
+  let segment = rawSamples.slice(startIdx, startIdx + N);
+  if (segment.length < N) segment = segment.concat(new Array(N - segment.length).fill(0));
+
+  const mean = rmDc ? segment.reduce((a, b) => a + b, 0) / N : 0;
+  const processed = segment.map((v, i) => {
+    let val = v - mean;
+    if (useHann) val *= 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
+    return val;
+  });
+
+  const step = Math.max(1, Math.floor(N / 400));
+  const waveData = [];
+  for (let i = 0; i < N; i += step) waveData.push(Number(processed[i].toFixed(4)));
+
+  const bins = 150;
+  const fftData = [];
+  const fftLabels = [];
+  for (let k = 0; k < bins; k++) {
+    let re = 0, im = 0;
+    for (let n = 0; n < N; n += 4) {
+      const angle = (2 * Math.PI * k * n) / N;
+      re += processed[n] * Math.cos(angle);
+      im -= processed[n] * Math.sin(angle);
+    }
+    fftData.push(Number((Math.sqrt(re * re + im * im) / N).toFixed(4)));
+    fftLabels.push(`${Math.round((k * sampleRate) / N)}Hz`);
+  }
+
+  const hexRows = [];
+  for (let i = 0; i < 80; i++) {
+    const int16 = Math.max(-32768, Math.min(32767, Math.round(segment[i] * 32767)));
+    const uint16 = int16 < 0 ? 0x10000 + int16 : int16;
+    const addr = '0x' + ((startIdx + i) * 2).toString(16).toUpperCase().padStart(6, '0');
+    hexRows.push({
+      pos: startIdx + i,
+      addr,
+      hex: '0x' + uint16.toString(16).toUpperCase().padStart(4, '0'),
+      dec: int16,
+      bin: uint16.toString(2).padStart(16, '0').replace(/(.{4})/g, '$1 ').trim()
+    });
+  }
+
+  updateUI(waveData, fftLabels, fftData, hexRows);
+  if (shouldPush) {
+    pushState(false, fileName, waveData, { labels: fftLabels, data: fftData }, hexRows);
+  }
+}
+
+function updateUI(waveData, fftLabels, fftData, hexRows, activeAddr = '') {
+  waveChart.data.labels = waveData.map((_, i) => i);
+  waveChart.data.datasets[0].data = waveData;
+  waveChart.update();
+
+  fftChart.data.labels = fftLabels;
+  fftChart.data.datasets[0].data = fftData;
+  fftChart.update();
+
+  const tbody = document.getElementById('hexBody');
+  tbody.innerHTML = hexRows.map(r => `
+    <tr class="${r.addr === activeAddr ? 'active' : ''}" onclick="selectHex('${r.addr}')">
+      <td>${r.pos}</td><td>${r.addr}</td><td>${r.hex}</td><td>${r.dec}</td><td>${r.bin}</td>
+    </tr>
+  `).join('');
+}
+
+async function selectHex(addr) {
+  document.querySelectorAll('#hexBody tr').forEach(tr => {
+    tr.classList.toggle('active', tr.children[1].innerText === addr);
+  });
+  await fetch('/api/state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ selected_hex_addr: addr })
+  });
+}
+
+async function pushState(recompute = false, fileName = null, waveData = null, fftObj = null, hexRows = null) {
+  if (recompute && rawSamples.length > 0) {
+    computeAndRender(fileName, true);
+    return;
+  }
+  const payload = {
+    channel: document.getElementById('channel').value,
+    start_time: parseFloat(document.getElementById('startTime').value),
+    fft_points: parseInt(document.getElementById('fftPoints').value),
+    hann_window: document.getElementById('hann').checked ? 1 : 0,
+    remove_dc: document.getElementById('removeDc').checked ? 1 : 0
+  };
+  if (fileName) payload.file_name = fileName;
+  if (waveData) payload.waveform_json = JSON.stringify(waveData);
+  if (fftObj) payload.fft_json = JSON.stringify(fftObj);
+  if (hexRows) payload.hex_table_json = JSON.stringify(hexRows);
+
+  await fetch('/api/state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+['channel', 'startTime', 'fftPoints', 'hann', 'removeDc'].forEach(id => {
+  document.getElementById(id).addEventListener('change', () => {
+    if (!isUpdatingFromCloud) pushState(true);
+  });
+});
+
+setInterval(async () => {
+  try {
+    const res = await fetch('/api/state');
+    const state = await res.json();
+    if (!state || !state.updated_at || state.updated_at === lastUpdated) return;
+    lastUpdated = state.updated_at;
+    isUpdatingFromCloud = true;
+
+    document.getElementById('channel').value = state.channel || 'CH1';
+    document.getElementById('startTime').value = state.start_time ?? 1.0;
+    document.getElementById('fftPoints').value = state.fft_points || 2048;
+    document.getElementById('hann').checked = !!state.hann_window;
+    document.getElementById('removeDc').checked = !!state.remove_dc;
+    if (state.file_name) document.getElementById('waveTitle').innerText = `時域波形圖 - ${state.file_name}`;
+
+    if (state.waveform_json && state.fft_json && state.hex_table_json) {
+      updateUI(
+        JSON.parse(state.waveform_json),
+        JSON.parse(state.fft_json).labels,
+        JSON.parse(state.fft_json).data,
+        JSON.parse(state.hex_table_json),
+        state.selected_hex_addr
+      );
+    }
+    isUpdatingFromCloud = false;
+  } catch (e) { isUpdatingFromCloud = false; }
+}, 600);
+</script>
+</body>
+</html>
